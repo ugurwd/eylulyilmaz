@@ -272,6 +272,11 @@ async function handleMessage(message, businessConnectionId = null) {
   let typingInterval = null;
 
   try {
+    // IMPORTANT: Mark business message as read immediately for double ticks
+    if (businessConnectionId && messageId) {
+      await markBusinessMessageAsRead(chatId, messageId, businessConnectionId);
+    }
+    
     // Send initial typing indicator
     if (businessConnectionId) {
       await sendTypingActionBusiness(chatId, businessConnectionId);
