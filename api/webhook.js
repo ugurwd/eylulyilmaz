@@ -1,4 +1,4 @@
-// Debug Version - Telegram Bot for Vercel
+// Adult Companion Telegram Bot for Vercel - COMPLETE FIXED VERSION
 // File: api/webhook.js
 
 // Constants
@@ -125,13 +125,14 @@ async function getDifyResponse(userMessage, userName = 'User', conversationId = 
   }
 }
 
-// Send Telegram message
-async function sendTelegramMessage(chatId, text, replyToMessageId = null) {
+// Send Telegram message WITH BUSINESS SUPPORT
+async function sendTelegramMessage(chatId, text, replyToMessageId = null, businessConnectionId = null) {
   const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   
   console.log('[TELEGRAM] Sending message...');
   console.log('[TELEGRAM] Chat ID:', chatId);
   console.log('[TELEGRAM] Reply to:', replyToMessageId);
+  console.log('[TELEGRAM] Business Connection ID:', businessConnectionId || 'none');
   console.log('[TELEGRAM] Text length:', text?.length || 0);
   
   if (!BOT_TOKEN) {
@@ -149,12 +150,20 @@ async function sendTelegramMessage(chatId, text, replyToMessageId = null) {
     disable_web_page_preview: true
   };
   
-  // Only add reply if message is recent (less than 30 seconds old)
+  // CRITICAL: Add business_connection_id for business messages
+  if (businessConnectionId) {
+    params.business_connection_id = businessConnectionId;
+    console.log('[TELEGRAM] Added business_connection_id to params');
+  }
+  
+  // Add reply_to_message_id if provided
   if (replyToMessageId) {
     params.reply_to_message_id = replyToMessageId;
   }
 
   try {
+    console.log('[TELEGRAM] Sending with params:', JSON.stringify(params).substring(0, 200));
+    
     const response = await fetchWithTimeout(
       `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
       {
@@ -213,32 +222,65 @@ async function sendTypingAction(chatId) {
   if (!BOT_TOKEN) return;
   
   try {
-    fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
+    const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ 
         chat_id: chatId, 
         action: 'typing' 
       }),
-    }).catch(() => {});
+    });
+    
+    if (!response.ok) {
+      const error = await response.json();
+      console.error('[TYPING] Error:', error.description);
+    }
   } catch (error) {
-    // Ignore typing errors
+    console.error('[TYPING] Failed:', error.message);
   }
 }
 
-// Main message handler
-async function handleMessage(message) {
+// Send typing action for business messages
+async function sendTypingActionBusiness(chatId, businessConnectionId) {
+  const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  if (!BOT_TOKEN) return;
+  
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        chat_id: chatId, 
+        action: 'typing',
+        business_connection_id: businessConnectionId
+      }),
+    });
+    
+    if (!response.ok) {
+      const error = await response.json();
+      console.error('[TYPING] Business error:', error.description);
+    }
+  } catch (error) {
+    console.error('[TYPING] Business failed:', error.message);
+  }
+}
+
+// Main message handler WITH BUSINESS SUPPORT
+async function handleMessage(message, businessConnectionId = null) {
   const startTime = Date.now();
   const chatId = message.chat?.id;
   const messageId = message.message_id;
   const userMessage = message.text || message.caption || '';
   const userId = message.from?.id;
   const userName = message.from?.first_name || 'User';
+  const isBusinessMessage = !!businessConnectionId;
 
   console.log('=====================================');
   console.log('[MESSAGE] New message received');
+  console.log('[MESSAGE] Type:', isBusinessMessage ? 'BUSINESS' : 'REGULAR');
   console.log('[MESSAGE] From:', userName, `(${userId})`);
   console.log('[MESSAGE] Chat:', chatId);
+  console.log('[MESSAGE] Business Connection ID:', businessConnectionId || 'NONE');
   console.log('[MESSAGE] Text:', userMessage.substring(0, 100));
   console.log('=====================================');
 
@@ -247,15 +289,35 @@ async function handleMessage(message) {
     return;
   }
 
-  // Only respond to private chats
-  if (message.chat.type !== 'private') {
+  // For regular messages, only respond to private chats
+  if (!isBusinessMessage && message.chat.type !== 'private') {
     console.log('[MESSAGE] Ignoring non-private chat');
     return;
   }
 
+  let typingInterval = null;
+
   try {
-    // Send typing indicator
-    sendTypingAction(chatId);
+    // Send initial typing indicator
+    if (businessConnectionId) {
+      await sendTypingActionBusiness(chatId, businessConnectionId);
+    } else {
+      await sendTypingAction(chatId);
+    }
+    
+    // Keep sending typing indicator every 5 seconds
+    typingInterval = setInterval(async () => {
+      try {
+        if (businessConnectionId) {
+          await sendTypingActionBusiness(chatId, businessConnectionId);
+        } else {
+          await sendTypingAction(chatId);
+        }
+        console.log('[TYPING] Refreshed typing indicator');
+      } catch (err) {
+        console.error('[TYPING] Failed to refresh:', err.message);
+      }
+    }, 5000); // Every 5 seconds
     
     // Get session
     const session = getSession(userId);
@@ -268,6 +330,12 @@ async function handleMessage(message) {
       session.conversationId
     );
     
+    // Clear typing indicator before sending message
+    if (typingInterval) {
+      clearInterval(typingInterval);
+      typingInterval = null;
+    }
+    
     // Update session if we got a conversation ID
     if (difyResponse?.conversation_id) {
       updateSession(userId, difyResponse.conversation_id);
@@ -277,8 +345,10 @@ async function handleMessage(message) {
     // Extract and send response
     const responseText = difyResponse?.answer || CONSTANTS.FALLBACK_MESSAGE;
     console.log('[RESPONSE] Sending to Telegram...');
+    console.log('[RESPONSE] With business ID:', businessConnectionId || 'none');
     
-    await sendTelegramMessage(chatId, responseText, messageId);
+    // CRITICAL: Pass businessConnectionId to sendTelegramMessage
+    await sendTelegramMessage(chatId, responseText, messageId, businessConnectionId);
     
     const elapsed = Date.now() - startTime;
     console.log(`[SUCCESS] ✅ Completed in ${elapsed}ms`);
@@ -287,9 +357,14 @@ async function handleMessage(message) {
     console.error('[ERROR] Processing failed:', error.message);
     console.error('[ERROR] Stack:', error.stack);
     
-    // Try to send fallback message
+    // Clear typing indicator if still running
+    if (typingInterval) {
+      clearInterval(typingInterval);
+    }
+    
+    // Try to send fallback message WITH businessConnectionId
     try {
-      await sendTelegramMessage(chatId, CONSTANTS.FALLBACK_MESSAGE, messageId);
+      await sendTelegramMessage(chatId, CONSTANTS.FALLBACK_MESSAGE, messageId, businessConnectionId);
       console.log('[FALLBACK] Sent fallback message');
     } catch (fallbackError) {
       console.error('[FALLBACK] Failed:', fallbackError.message);
@@ -343,19 +418,17 @@ export default async function handler(req, res) {
     if (update.message) {
       console.log('[WEBHOOK] Processing regular message');
       if (update.message.text || update.message.caption) {
-        await handleMessage(update.message, false);
+        await handleMessage(update.message, null);
       } else {
         console.log('[WEBHOOK] Message has no text/caption, ignoring');
       }
     } else if (update.business_message) {
-      console.log('[WEBHOOK] Processing business message');
+      console.log('[WEBHOOK] Processing BUSINESS message');
       if (update.business_message.text || update.business_message.caption) {
-        // Extract business_connection_id and add it to the message object
-        const businessMessage = {
-          ...update.business_message,
-          business_connection_id: update.business_message.business_connection_id || update.business_connection?.id
-        };
-        await handleMessage(businessMessage, true);
+        // CRITICAL: Extract and pass business_connection_id
+        const businessConnectionId = update.business_message.business_connection_id;
+        console.log('[WEBHOOK] Business Connection ID:', businessConnectionId);
+        await handleMessage(update.business_message, businessConnectionId);
       } else {
         console.log('[WEBHOOK] Business message has no text/caption, ignoring');
       }
@@ -377,3 +450,5 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true, error: error.message });
   }
 }
+
+// Updated: Force deployment
