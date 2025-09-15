@@ -4,7 +4,7 @@
 // Constants
 const CONSTANTS = {
   MAX_MESSAGE_LENGTH: 4096,
-  DIFY_TIMEOUT: 8000, // 8 seconds (leaving 2s buffer for Vercel's 10s limit)
+  DIFY_TIMEOUT: 58000, // 58 seconds (safe margin for Dify's 55s response)
   TELEGRAM_TIMEOUT: 5000, // 5 seconds
   FALLBACK_MESSAGE: "😔 Üzgünüm, şu anda bir sorun yaşıyorum. Lütfen tekrar dene.",
 };
@@ -153,6 +153,28 @@ async function sendTelegramMessage(chatId, text, replyToMessageId = null) {
     
     if (!data.ok) {
       console.error('Telegram error:', data.description);
+      
+      // If message to reply not found, send without reply
+      if (data.description?.includes('message to be replied not found') || 
+          data.description?.includes('MESSAGE_ID_INVALID')) {
+        console.log('Retrying without reply_to_message_id...');
+        delete params.reply_to_message_id;
+        
+        const retryResponse = await fetchWithTimeout(
+          `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params),
+          },
+          CONSTANTS.TELEGRAM_TIMEOUT
+        );
+        const retryData = await retryResponse.json();
+        if (retryData.ok) {
+          console.log('Message sent successfully without reply');
+          return retryData.result;
+        }
+      }
       
       // Retry without parse_mode if parsing failed
       if (data.description?.includes('parse')) {
