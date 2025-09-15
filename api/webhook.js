@@ -343,14 +343,19 @@ export default async function handler(req, res) {
     if (update.message) {
       console.log('[WEBHOOK] Processing regular message');
       if (update.message.text || update.message.caption) {
-        await handleMessage(update.message);
+        await handleMessage(update.message, false);
       } else {
         console.log('[WEBHOOK] Message has no text/caption, ignoring');
       }
     } else if (update.business_message) {
       console.log('[WEBHOOK] Processing business message');
       if (update.business_message.text || update.business_message.caption) {
-        await handleMessage(update.business_message);
+        // Extract business_connection_id and add it to the message object
+        const businessMessage = {
+          ...update.business_message,
+          business_connection_id: update.business_message.business_connection_id || update.business_connection?.id
+        };
+        await handleMessage(businessMessage, true);
       } else {
         console.log('[WEBHOOK] Business message has no text/caption, ignoring');
       }
