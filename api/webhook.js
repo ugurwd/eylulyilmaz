@@ -660,74 +660,60 @@ async function sendFormattedMessage(chatId, responseText, replyToMessageId, busi
   }
 }
 
-// Universal Message Handler with Asynchronous logic
+// Universal Message Handler with Full Success & Error Logging
 async function handleMessage(message, isBusiness = false) {
-  const startTime = Date.now();
-  const businessConnectionId = isBusiness ? message.business_connection_id : null;
-  const chatId = message.chat.id;
-  const messageId = message.message_id;
-  const userMessage = message.text || message.caption || 'Media message';
-  const userFirstName = message.from?.first_name || (isBusiness ? 'Müşteri' : 'Kullanıcı');
-  const userId = message.from?.id;
+    const startTime = Date.now();
+    const businessConnectionId = isBusiness ? message.business_connection_id : null;
+    const chatId = message.chat.id;
+    const messageId = message.message_id;
+    const userMessage = message.text || message.caption || 'Media message';
+    const userFirstName = message.from?.first_name || (isBusiness ? 'Müşteri' : 'Kullanıcı');
+    const userId = message.from?.id;
 
-  let typingInterval = null;
+    let typingInterval = null;
 
-  try {
-    // 1. Start "typing..." animation immediately
-    const typingParams = { chat_id: chatId, action: 'typing' };
-    if (isBusiness) typingParams.business_connection_id = businessConnectionId;
-    await telegramApiCall('sendChatAction', typingParams);
+    try {
+        const typingParams = { chat_id: chatId, action: 'typing' };
+        if (isBusiness) typingParams.business_connection_id = businessConnectionId;
+        await telegramApiCall('sendChatAction', typingParams);
 
-    // 2. Keep the animation alive every 5 seconds
-    typingInterval = setInterval(() => {
-      telegramApiCall('sendChatAction', typingParams).catch(console.error);
-    }, 5000);
+        typingInterval = setInterval(() => {
+            telegramApiCall('sendChatAction', typingParams).catch(console.error);
+        }, 5000);
 
-    // 3. Check rate limits
-    if (!rateLimiter.isAllowed(userId)) {
-      console.log(`⚠️ Rate limit exceeded for user ${userId}`);
-      await sendFormattedMessage(
-        chatId,
-        "🙏 *Lütfen biraz daha yavaş mesaj gönderin.* Size daha iyi hizmet verebilmem için zaman tanıyın.",
-        messageId,
-        businessConnectionId
-      );
-      return;
-    }
-    
-    // Ignore messages from non-private chats for regular bots
-    if (!isBusiness && message.chat.type !== 'private') {
-        console.log(`⚠️ Ignoring message from ${message.chat.type} chat.`);
-        return;
-    }
+        if (!rateLimiter.isAllowed(userId) || (!isBusiness && message.chat.type !== 'private')) {
+            console.log(`⚠️ Message ignored for user ${userId}`);
+            return;
+        }
 
-    // 4. Get session and make the slow AI call
-    const session = sessionManager.getUserSession(userId);
-    const contextualMessage = isBusiness ? `Müşteri: ${userFirstName}, Mesaj: ${userMessage}` : userMessage;
-    
-    console.log('📤 Sending message to Dify AI (this may take a while)...');
-    const difyResponse = await getDifyResponse(contextualMessage, userFirstName, session.conversationId);
+        console.log('✅ [Step 1] Initial checks passed. Preparing to call Dify AI.');
+        const session = sessionManager.getUserSession(userId);
+        const contextualMessage = isBusiness ? `Müşteri: ${userFirstName}, Mesaj: ${userMessage}` : userMessage;
 
-    if (difyResponse?.conversation_id) {
-      sessionManager.updateUserSession(userId, difyResponse.conversation_id);
-    }
+        console.log('📤 [Step 2] Sending request to Dify AI...');
+        const difyResponse = await getDifyResponse(contextualMessage, userFirstName, session.conversationId);
+        console.log('📥 [Step 3] Successfully received response from Dify AI!');
 
-    // 5. Send the final response
-    const responseText = difyResponse?.answer || "🤔 *Anlayamadım, lütfen tekrar söyler misiniz?* Size nasıl yardımcı olabilirim?";
-    await sendFormattedMessage(chatId, responseText, messageId, businessConnectionId);
-    
-    const processingTime = Date.now() - startTime;
-    console.log(`✅ Message processed in ${processingTime}ms (Type: ${isBusiness ? 'Business' : 'Regular'})`);
+        if (difyResponse?.conversation_id) {
+            sessionManager.updateUserSession(userId, difyResponse.conversation_id);
+        }
+        const responseText = difyResponse?.answer || "🤔 *Anlayamadım, lütfen tekrar söyler misiniz?*";
+        
+        console.log('✅ [Step 4] Sending final formatted message to Telegram.');
+        await sendFormattedMessage(chatId, responseText, messageId, businessConnectionId);
+        console.log('🎉 [Step 5] Process complete! Final message sent.');
+        
+        const processingTime = Date.now() - startTime;
+        console.log(`✅ Message processed in ${processingTime}ms`);
 
-  } catch (error) {
-    console.error(`❌ Error processing ${isBusiness ? 'business' : 'regular'} message:`, error);
-    await sendFormattedMessage(chatId, CONSTANTS.FALLBACK_MESSAGE, messageId, businessConnectionId);
-  } finally {
-    // 6. ALWAYS stop the typing animation
-    if (typingInterval) {
-      clearInterval(typingInterval);
-    }
-  }
+    } catch (error) {
+        console.error('💥 [CRITICAL ERROR] The process failed. Full error object:', error);
+        await sendFormattedMessage(chatId, CONSTANTS.FALLBACK_MESSAGE, messageId, businessConnectionId);
+    } finally {
+        if (typingInterval) {
+            clearInterval(typingInterval);
+        }
+    }
 }
 
 // Main webhook handler (NOW ASYNCHRONOUS)
