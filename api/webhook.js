@@ -125,7 +125,7 @@ async function getDifyResponse(userMessage, userName = 'User', conversationId = 
   }
 }
 
-// Send Telegram message WITH BUSINESS SUPPORT
+// Send Telegram message WITH BUSINESS SUPPORT (SIMPLIFIED)
 async function sendTelegramMessage(chatId, text, replyToMessageId = null, businessConnectionId = null) {
   const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   
@@ -154,10 +154,9 @@ async function sendTelegramMessage(chatId, text, replyToMessageId = null, busine
   if (businessConnectionId) {
     params.business_connection_id = businessConnectionId;
     console.log('[TELEGRAM] Added business_connection_id to params');
-  }
-  
-  // Add reply_to_message_id if provided
-  if (replyToMessageId) {
+    // Don't add reply_to for business messages (timing issues)
+  } else if (replyToMessageId) {
+    // Only add reply for regular messages
     params.reply_to_message_id = replyToMessageId;
   }
 
@@ -178,36 +177,11 @@ async function sendTelegramMessage(chatId, text, replyToMessageId = null, busine
     
     if (!data.ok) {
       console.error('[TELEGRAM] Error:', data.description);
-      
-      // If message to reply not found, send without reply
-      if (data.description?.includes('message to be replied not found') || 
-          data.description?.includes('MESSAGE_ID_INVALID')) {
-        console.log('[TELEGRAM] Retrying without reply_to_message_id...');
-        delete params.reply_to_message_id;
-        
-        const retryResponse = await fetchWithTimeout(
-          `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(params),
-          },
-          CONSTANTS.TELEGRAM_TIMEOUT
-        );
-        const retryData = await retryResponse.json();
-        if (retryData.ok) {
-          console.log('[TELEGRAM] Success (without reply)');
-          return retryData.result;
-        } else {
-          console.error('[TELEGRAM] Retry failed:', retryData.description);
-          throw new Error(retryData.description);
-        }
-      }
-      
       throw new Error(data.description || 'Telegram API error');
     }
 
     console.log('[TELEGRAM] Message sent successfully!');
+    console.log('[TELEGRAM] Message ID:', data.result?.message_id);
     return data.result;
     
   } catch (error) {
