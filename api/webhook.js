@@ -239,6 +239,38 @@ async function sendTypingActionBusiness(chatId, businessConnectionId) {
   }
 }
 
+// Mark business message as read (for double ticks)
+async function markBusinessMessageAsRead(chatId, messageId, businessConnectionId) {
+  const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  if (!BOT_TOKEN || !businessConnectionId) return;
+  
+  console.log('[READ] Marking message as read...');
+  console.log('[READ] Chat ID:', chatId);
+  console.log('[READ] Message ID:', messageId);
+  console.log('[READ] Business Connection:', businessConnectionId);
+  
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/readBusinessMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        business_connection_id: businessConnectionId,
+        chat_id: chatId,
+        message_id: messageId
+      }),
+    });
+    
+    const data = await response.json();
+    if (data.ok) {
+      console.log('[READ] ✅ Message marked as read - double ticks should appear');
+    } else {
+      console.error('[READ] Failed to mark as read:', data.description);
+    }
+  } catch (error) {
+    console.error('[READ] Error marking message as read:', error.message);
+  }
+}
+
 // Main message handler WITH BUSINESS SUPPORT
 async function handleMessage(message, businessConnectionId = null) {
   const startTime = Date.now();
