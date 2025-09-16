@@ -1,10 +1,4 @@
 {
-  "crons": [
-    {
-      "path": "/api/webhook?action=process",
-      "schedule": "* * * * *"
-    }
-  ],
   "functions": {
     "api/webhook.js": {
       "maxDuration": 60
