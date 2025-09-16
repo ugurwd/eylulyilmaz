@@ -1,10 +1,10 @@
-// Adult Companion Telegram Bot for Vercel - COMPLETE FIXED VERSION
+// Adult Companion Telegram Bot for Vercel - COMPLETE VERSION WITH IMAGE SUPPORT
 // File: api/webhook.js
 
 // Constants
 const CONSTANTS = {
   MAX_MESSAGE_LENGTH: 4096,
-  DIFY_TIMEOUT: 58000, // 58 seconds for Dify
+  DIFY_TIMEOUT: 55000, // 55 seconds for Dify
   TELEGRAM_TIMEOUT: 5000, // 5 seconds
   FALLBACK_MESSAGE: "😔 Üzgünüm, şu anda bir sorun yaşıyorum. Lütfen tekrar dene.",
 };
@@ -64,7 +64,34 @@ async function fetchWithTimeout(url, options = {}, timeout = 8000) {
   }
 }
 
-// Get Dify AI response
+// Parse Dify response to extract text and image URLs
+function parseDifyResponse(difyResponse) {
+  const answer = difyResponse?.answer || '';
+  
+  // Regular expression to find URLs (especially image URLs)
+  const urlRegex = /(https?:\/\/[^\s]+\.(?:jpg|jpeg|png|gif|webp)[^\s]*)/gi;
+  
+  // Extract all image URLs
+  const imageUrls = answer.match(urlRegex) || [];
+  
+  // Remove URLs from the text to get clean message
+  let cleanText = answer.replace(urlRegex, '').trim();
+  
+  // Clean up any double spaces or weird formatting
+  cleanText = cleanText.replace(/\s+/g, ' ').trim();
+  
+  // If no text remains, add a default message
+  if (!cleanText && imageUrls.length > 0) {
+    cleanText = "✨ İşte senin için hazırladıklarım:";
+  }
+  
+  return {
+    text: cleanText || CONSTANTS.FALLBACK_MESSAGE,
+    images: imageUrls
+  };
+}
+
+// Get Dify AI response with streaming support
 async function getDifyResponse(userMessage, userName = 'User', conversationId = '') {
   const DIFY_API_URL = process.env.DIFY_API_URL;
   const DIFY_API_TOKEN = process.env.DIFY_API_TOKEN;
@@ -83,7 +110,7 @@ async function getDifyResponse(userMessage, userName = 'User', conversationId = 
   const requestBody = {
     inputs: {},
     query: userMessage.substring(0, 4000),
-    response_mode: 'blocking',
+    response_mode: 'streaming', // Using streaming for better timeout handling
     user: userName,
     conversation_id: conversationId || '',
     files: [],
@@ -115,17 +142,172 @@ async function getDifyResponse(userMessage, userName = 'User', conversationId = 
       throw new Error(`Dify error: ${response.status}`);
     }
 
-    const data = await response.json();
-    console.log('[DIFY] Success! Answer length:', data.answer?.length || 0);
-    return data;
+    // Handle streaming response
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let fullAnswer = '';
+    let conversationIdFromStream = '';
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const jsonStr = line.slice(6);
+          if (jsonStr === '[DONE]') continue;
+          
+          try {
+            const data = JSON.parse(jsonStr);
+            
+            // Extract answer and conversation_id from streaming chunks
+            if (data.answer) {
+              fullAnswer += data.answer;
+            }
+            if (data.conversation_id) {
+              conversationIdFromStream = data.conversation_id;
+            }
+          } catch (e) {
+            console.log('[DIFY] Could not parse chunk:', e.message);
+          }
+        }
+      }
+      
+      // Check if we're approaching timeout
+      if (Date.now() - startTime > 50000) {
+        console.log('[DIFY] Approaching timeout, returning partial response');
+        break;
+      }
+    }
+
+    console.log('[DIFY] Success! Answer length:', fullAnswer.length);
+    return {
+      answer: fullAnswer || "Yanıt alınamadı, lütfen tekrar deneyin.",
+      conversation_id: conversationIdFromStream || conversationId
+    };
     
   } catch (error) {
     console.error('[DIFY] Failed:', error.message);
+    
+    // If timeout, return a user-friendly message instead of throwing
+    if (error.message === 'Request timeout') {
+      return {
+        answer: "⏱️ Yanıt sürem doldu, lütfen sorunuzu daha kısa sorarak tekrar deneyin.",
+        conversation_id: conversationId
+      };
+    }
+    
     throw error;
   }
 }
 
-// Send Telegram message WITH BUSINESS SUPPORT (SIMPLIFIED)
+// Send photo to Telegram
+async function sendTelegramPhoto(chatId, photoUrl, caption = '', replyToMessageId = null, businessConnectionId = null) {
+  const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  
+  console.log('[TELEGRAM] Sending photo...');
+  console.log('[TELEGRAM] Photo URL:', photoUrl.substring(0, 100));
+  
+  const params = {
+    chat_id: chatId,
+    photo: photoUrl,
+    caption: caption.substring(0, 1024), // Telegram caption limit
+    parse_mode: 'HTML'
+  };
+  
+  if (businessConnectionId) {
+    params.business_connection_id = businessConnectionId;
+  } else if (replyToMessageId) {
+    params.reply_to_message_id = replyToMessageId;
+  }
+  
+  try {
+    const response = await fetchWithTimeout(
+      `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+      },
+      CONSTANTS.TELEGRAM_TIMEOUT
+    );
+    
+    const data = await response.json();
+    
+    if (!data.ok) {
+      console.error('[TELEGRAM] Photo error:', data.description);
+      throw new Error(data.description || 'Failed to send photo');
+    }
+    
+    console.log('[TELEGRAM] Photo sent successfully!');
+    return data.result;
+    
+  } catch (error) {
+    console.error('[TELEGRAM] Photo send failed:', error.message);
+    throw error;
+  }
+}
+
+// Send media group (multiple photos)
+async function sendTelegramMediaGroup(chatId, photoUrls, caption = '', replyToMessageId = null, businessConnectionId = null) {
+  const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  
+  console.log('[TELEGRAM] Sending media group...');
+  console.log('[TELEGRAM] Number of photos:', photoUrls.length);
+  
+  // Prepare media array (max 10 photos in a group)
+  const media = photoUrls.slice(0, 10).map((url, index) => ({
+    type: 'photo',
+    media: url,
+    // Only first photo can have caption in media group
+    caption: index === 0 ? caption.substring(0, 1024) : undefined,
+    parse_mode: index === 0 ? 'HTML' : undefined
+  }));
+  
+  const params = {
+    chat_id: chatId,
+    media: media
+  };
+  
+  if (businessConnectionId) {
+    params.business_connection_id = businessConnectionId;
+  } else if (replyToMessageId) {
+    params.reply_to_message_id = replyToMessageId;
+  }
+  
+  try {
+    const response = await fetchWithTimeout(
+      `https://api.telegram.org/bot${BOT_TOKEN}/sendMediaGroup`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+      },
+      CONSTANTS.TELEGRAM_TIMEOUT * 2 // Longer timeout for multiple images
+    );
+    
+    const data = await response.json();
+    
+    if (!data.ok) {
+      console.error('[TELEGRAM] Media group error:', data.description);
+      throw new Error(data.description || 'Failed to send media group');
+    }
+    
+    console.log('[TELEGRAM] Media group sent successfully!');
+    return data.result;
+    
+  } catch (error) {
+    console.error('[TELEGRAM] Media group send failed:', error.message);
+    throw error;
+  }
+}
+
+// Send Telegram message
 async function sendTelegramMessage(chatId, text, replyToMessageId = null, businessConnectionId = null) {
   const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   
@@ -147,16 +329,13 @@ async function sendTelegramMessage(chatId, text, replyToMessageId = null, busine
   const params = {
     chat_id: chatId,
     text: cleanText,
-    disable_web_page_preview: true
+    disable_web_page_preview: false, // Enable previews for URLs
+    parse_mode: 'HTML'
   };
   
-  // CRITICAL: Add business_connection_id for business messages
   if (businessConnectionId) {
     params.business_connection_id = businessConnectionId;
-    console.log('[TELEGRAM] Added business_connection_id to params');
-    // Don't add reply_to for business messages (timing issues)
   } else if (replyToMessageId) {
-    // Only add reply for regular messages
     params.reply_to_message_id = replyToMessageId;
   }
 
@@ -187,6 +366,44 @@ async function sendTelegramMessage(chatId, text, replyToMessageId = null, busine
   } catch (error) {
     console.error('[TELEGRAM] Send failed:', error.message);
     throw error;
+  }
+}
+
+// Smart message sender that handles both text and images
+async function sendSmartMessage(chatId, difyResponse, replyToMessageId = null, businessConnectionId = null) {
+  // Parse the response to extract text and images
+  const { text, images } = parseDifyResponse(difyResponse);
+  
+  console.log('[SMART] Parsed content:');
+  console.log('[SMART] Text:', text.substring(0, 100));
+  console.log('[SMART] Images found:', images.length);
+  
+  try {
+    if (images.length === 0) {
+      // No images, just send text
+      return await sendTelegramMessage(chatId, text, replyToMessageId, businessConnectionId);
+      
+    } else if (images.length === 1) {
+      // Single image - send as photo with caption
+      return await sendTelegramPhoto(chatId, images[0], text, replyToMessageId, businessConnectionId);
+      
+    } else {
+      // Multiple images - send as media group
+      const result = await sendTelegramMediaGroup(chatId, images, text, replyToMessageId, businessConnectionId);
+      
+      // If text is too long for caption, send it separately
+      if (text.length > 1024) {
+        const remainingText = text.substring(1024);
+        await sendTelegramMessage(chatId, remainingText, null, businessConnectionId);
+      }
+      
+      return result;
+    }
+  } catch (error) {
+    console.error('[SMART] Failed to send smart message:', error.message);
+    // Fallback to simple text message with URLs
+    const fallbackText = text + '\n\n' + images.join('\n\n');
+    return await sendTelegramMessage(chatId, fallbackText, replyToMessageId, businessConnectionId);
   }
 }
 
@@ -353,13 +570,9 @@ async function handleMessage(message, businessConnectionId = null) {
       console.log('[SESSION] Updated with ID:', difyResponse.conversation_id);
     }
     
-    // Extract and send response
-    const responseText = difyResponse?.answer || CONSTANTS.FALLBACK_MESSAGE;
-    console.log('[RESPONSE] Sending to Telegram...');
-    console.log('[RESPONSE] With business ID:', businessConnectionId || 'none');
-    
-    // CRITICAL: Pass businessConnectionId to sendTelegramMessage
-    await sendTelegramMessage(chatId, responseText, messageId, businessConnectionId);
+    // Send response using smart message handler
+    console.log('[RESPONSE] Sending smart message...');
+    await sendSmartMessage(chatId, difyResponse, messageId, businessConnectionId);
     
     const elapsed = Date.now() - startTime;
     console.log(`[SUCCESS] ✅ Completed in ${elapsed}ms`);
@@ -462,4 +675,4 @@ export default async function handler(req, res) {
   }
 }
 
-// Updated: Force deployment
+// Updated: Force deployment with image support
