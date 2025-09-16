@@ -1,203 +1,261 @@
-// Adult Companion Telegram Bot for Vercel - COMPLETE VERSION WITH IMAGE SUPPORT
-// File: api/webhook.js
+// Queue-Based Telegram Bot with Background Processing
+// File structure:
+// - api/webhook.js (receives messages, adds to queue)
+// - api/process.js (processes queue items)
+
+// ============================================
+// File: api/webhook.js - Main webhook handler
+// ============================================
+
+import { kv } from '@vercel/kv'; // You need to enable Vercel KV Storage
 
 // Constants
 const CONSTANTS = {
-  MAX_MESSAGE_LENGTH: 4096,
-  DIFY_TIMEOUT: 55000, // 55 seconds for Dify
-  TELEGRAM_TIMEOUT: 5000, // 5 seconds
-  FALLBACK_MESSAGE: "😔 Üzgünüm, şu anda bir sorun yaşıyorum. Lütfen tekrar dene.",
+  QUEUE_KEY: 'message_queue',
+  PROCESSING_KEY: 'processing',
+  MAX_QUEUE_SIZE: 1000,
 };
 
-// Simple in-memory session store
-const sessions = new Map();
-
-// Get or create session
-function getSession(userId) {
-  const key = userId?.toString();
-  if (!key) return { conversationId: '' };
+// Add message to queue
+async function addToQueue(message, businessConnectionId = null) {
+  const queueItem = {
+    id: `${message.from.id}_${Date.now()}`,
+    chatId: message.chat.id,
+    messageId: message.message_id,
+    userId: message.from.id,
+    userName: message.from.first_name || 'User',
+    text: message.text || message.caption || '',
+    businessConnectionId: businessConnectionId,
+    timestamp: Date.now(),
+    status: 'pending'
+  };
   
-  if (!sessions.has(key)) {
-    sessions.set(key, { conversationId: '', lastAccess: Date.now() });
-  }
+  // Add to queue in Vercel KV
+  await kv.lpush(CONSTANTS.QUEUE_KEY, JSON.stringify(queueItem));
   
-  const session = sessions.get(key);
-  session.lastAccess = Date.now();
+  // Trim queue to max size
+  await kv.ltrim(CONSTANTS.QUEUE_KEY, 0, CONSTANTS.MAX_QUEUE_SIZE);
   
-  // Clean old sessions (simple cleanup)
-  if (sessions.size > 1000) {
-    const oldestKey = Array.from(sessions.keys())[0];
-    sessions.delete(oldestKey);
-  }
-  
-  return session;
+  console.log('[QUEUE] Added item:', queueItem.id);
+  return queueItem;
 }
 
-// Update session
-function updateSession(userId, conversationId) {
-  const key = userId?.toString();
-  if (!key || !conversationId) return;
+// Send typing indicator
+async function sendTypingAction(chatId, businessConnectionId = null) {
+  const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   
-  const session = getSession(userId);
-  session.conversationId = conversationId;
-  sessions.set(key, session);
-}
-
-// Fast fetch with timeout
-async function fetchWithTimeout(url, options = {}, timeout = 8000) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  const params = {
+    chat_id: chatId,
+    action: 'typing'
+  };
+  
+  if (businessConnectionId) {
+    params.business_connection_id = businessConnectionId;
+  }
   
   try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params)
     });
-    clearTimeout(timeoutId);
-    return response;
   } catch (error) {
-    clearTimeout(timeoutId);
-    if (error.name === 'AbortError') {
-      throw new Error('Request timeout');
-    }
-    throw error;
+    console.error('[TYPING] Failed:', error.message);
   }
 }
 
-// Parse Dify response to extract text and image URLs
+// Mark business message as read
+async function markBusinessMessageAsRead(chatId, messageId, businessConnectionId) {
+  const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  if (!businessConnectionId) return;
+  
+  try {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/readBusinessMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        business_connection_id: businessConnectionId,
+        chat_id: chatId,
+        message_id: messageId
+      })
+    });
+    console.log('[READ] Marked as read');
+  } catch (error) {
+    console.error('[READ] Failed:', error.message);
+  }
+}
+
+// Trigger background processing
+async function triggerProcessing() {
+  try {
+    // Call the process endpoint
+    // Using internal function call to avoid network overhead
+    fetch(`${process.env.VERCEL_URL}/api/process`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.INTERNAL_SECRET || 'secret'}`,
+      }
+    }).catch(err => console.log('[TRIGGER] Background process started'));
+  } catch (error) {
+    console.error('[TRIGGER] Failed to start processing:', error.message);
+  }
+}
+
+// Main webhook handler
+export default async function handler(req, res) {
+  console.log('=====================================');
+  console.log(`[WEBHOOK] Called at ${new Date().toISOString()}`);
+  console.log('[WEBHOOK] Method:', req.method);
+  
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    const update = req.body;
+    
+    if (!update) {
+      return res.status(400).json({ error: 'No body' });
+    }
+    
+    let message = null;
+    let businessConnectionId = null;
+    
+    // Extract message
+    if (update.message?.text || update.message?.caption) {
+      message = update.message;
+    } else if (update.business_message?.text || update.business_message?.caption) {
+      message = update.business_message;
+      businessConnectionId = update.business_message.business_connection_id;
+    }
+    
+    if (!message) {
+      return res.status(200).json({ ok: true });
+    }
+    
+    // Only process private chats
+    if (!businessConnectionId && message.chat.type !== 'private') {
+      return res.status(200).json({ ok: true });
+    }
+    
+    console.log('[MESSAGE] From:', message.from.first_name, `(${message.from.id})`);
+    console.log('[MESSAGE] Text:', (message.text || message.caption || '').substring(0, 100));
+    
+    // Mark as read for business messages
+    if (businessConnectionId) {
+      await markBusinessMessageAsRead(message.chat.id, message.message_id, businessConnectionId);
+    }
+    
+    // Send typing indicator
+    await sendTypingAction(message.chat.id, businessConnectionId);
+    
+    // Add to queue
+    await addToQueue(message, businessConnectionId);
+    
+    // Trigger background processing
+    await triggerProcessing();
+    
+    console.log('[WEBHOOK] Message queued successfully');
+    
+    // Return immediately (don't wait for processing)
+    return res.status(200).json({ ok: true });
+    
+  } catch (error) {
+    console.error('[WEBHOOK] Error:', error.message);
+    return res.status(200).json({ ok: true });
+  }
+}
+
+// ============================================
+// File: api/process.js - Background processor
+// ============================================
+
+import { kv } from '@vercel/kv';
+
+const PROCESS_CONSTANTS = {
+  QUEUE_KEY: 'message_queue',
+  PROCESSING_KEY: 'processing',
+  SESSION_KEY: 'sessions',
+  DIFY_TIMEOUT: 55000,
+  MAX_RETRIES: 2,
+};
+
+// Get session from KV
+async function getSession(userId) {
+  const sessions = await kv.hget(PROCESS_CONSTANTS.SESSION_KEY, userId) || {};
+  return sessions.conversationId || '';
+}
+
+// Update session in KV
+async function updateSession(userId, conversationId) {
+  if (!conversationId) return;
+  await kv.hset(PROCESS_CONSTANTS.SESSION_KEY, userId, { conversationId });
+}
+
+// Parse Dify response
 function parseDifyResponse(difyResponse) {
   const answer = difyResponse?.answer || '';
+  const urlRegex = /(https?:\/\/[^\s]+\.(?:jpg|jpeg|png|gif|webp)(?:\?[^\s]*)?)/gi;
+  const imageUrls = [];
+  let match;
   
-  // Regular expression to find URLs (especially image URLs)
-  const urlRegex = /(https?:\/\/[^\s]+\.(?:jpg|jpeg|png|gif|webp)[^\s]*)/gi;
+  while ((match = urlRegex.exec(answer)) !== null) {
+    imageUrls.push(match[1]);
+  }
   
-  // Extract all image URLs
-  const imageUrls = answer.match(urlRegex) || [];
+  let cleanText = answer;
+  imageUrls.forEach(url => {
+    cleanText = cleanText.replace(url, '');
+  });
   
-  // Remove URLs from the text to get clean message
-  let cleanText = answer.replace(urlRegex, '').trim();
-  
-  // Clean up any double spaces or weird formatting
   cleanText = cleanText.replace(/\s+/g, ' ').trim();
   
-  // If no text remains, add a default message
   if (!cleanText && imageUrls.length > 0) {
     cleanText = "✨ İşte senin için hazırladıklarım:";
   }
   
-  return {
-    text: cleanText || CONSTANTS.FALLBACK_MESSAGE,
-    images: imageUrls
-  };
+  return { text: cleanText, images: imageUrls };
 }
 
-// Get Dify AI response with streaming support
-async function getDifyResponse(userMessage, userName = 'User', conversationId = '') {
-  const DIFY_API_URL = process.env.DIFY_API_URL;
-  const DIFY_API_TOKEN = process.env.DIFY_API_TOKEN;
-
-  console.log('[DIFY] Starting request...');
-  console.log('[DIFY] API URL:', DIFY_API_URL);
-  console.log('[DIFY] Token exists:', !!DIFY_API_TOKEN);
-  console.log('[DIFY] Message:', userMessage.substring(0, 100));
-  console.log('[DIFY] ConversationId:', conversationId || 'new');
-
-  if (!DIFY_API_URL || !DIFY_API_TOKEN) {
-    console.error('[DIFY] Missing configuration');
-    throw new Error('Dify API not configured');
-  }
-
-  const requestBody = {
-    inputs: {},
-    query: userMessage.substring(0, 4000),
-    response_mode: 'streaming', // Using streaming for better timeout handling
-    user: userName,
-    conversation_id: conversationId || '',
-    files: [],
-    auto_generate_name: false
-  };
-
+// Call Dify API
+async function callDifyAPI(text, userName, conversationId) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), PROCESS_CONSTANTS.DIFY_TIMEOUT);
+  
   try {
-    const startTime = Date.now();
-    const response = await fetchWithTimeout(
-      `${DIFY_API_URL}/chat-messages`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${DIFY_API_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(requestBody),
+    const response = await fetch(`${process.env.DIFY_API_URL}/chat-messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.DIFY_API_TOKEN}`,
+        'Content-Type': 'application/json',
       },
-      CONSTANTS.DIFY_TIMEOUT
-    );
-
-    const elapsed = Date.now() - startTime;
-    console.log(`[DIFY] Response received in ${elapsed}ms`);
-    console.log('[DIFY] Status:', response.status);
-
+      body: JSON.stringify({
+        inputs: {},
+        query: text,
+        response_mode: 'blocking',
+        user: userName,
+        conversation_id: conversationId || '',
+        files: [],
+        auto_generate_name: false
+      }),
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
     if (!response.ok) {
-      const errorText = await response.text();
-      console.error('[DIFY] Error response:', errorText.substring(0, 500));
       throw new Error(`Dify error: ${response.status}`);
     }
-
-    // Handle streaming response
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let fullAnswer = '';
-    let conversationIdFromStream = '';
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || ''; // Keep incomplete line in buffer
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const jsonStr = line.slice(6);
-          if (jsonStr === '[DONE]') continue;
-          
-          try {
-            const data = JSON.parse(jsonStr);
-            
-            // Extract answer and conversation_id from streaming chunks
-            if (data.answer) {
-              fullAnswer += data.answer;
-            }
-            if (data.conversation_id) {
-              conversationIdFromStream = data.conversation_id;
-            }
-          } catch (e) {
-            console.log('[DIFY] Could not parse chunk:', e.message);
-          }
-        }
-      }
-      
-      // Check if we're approaching timeout
-      if (Date.now() - startTime > 50000) {
-        console.log('[DIFY] Approaching timeout, returning partial response');
-        break;
-      }
-    }
-
-    console.log('[DIFY] Success! Answer length:', fullAnswer.length);
-    return {
-      answer: fullAnswer || "Yanıt alınamadı, lütfen tekrar deneyin.",
-      conversation_id: conversationIdFromStream || conversationId
-    };
+    
+    const data = await response.json();
+    return data;
     
   } catch (error) {
-    console.error('[DIFY] Failed:', error.message);
+    clearTimeout(timeoutId);
     
-    // If timeout, return a user-friendly message instead of throwing
-    if (error.message === 'Request timeout') {
+    if (error.name === 'AbortError') {
       return {
-        answer: "⏱️ Yanıt sürem doldu, lütfen sorunuzu daha kısa sorarak tekrar deneyin.",
+        answer: "⏱️ Bu işlem çok uzun sürdü. Lütfen daha kısa bir mesajla tekrar dene.",
         conversation_id: conversationId
       };
     }
@@ -206,473 +264,247 @@ async function getDifyResponse(userMessage, userName = 'User', conversationId = 
   }
 }
 
-// Send photo to Telegram
-async function sendTelegramPhoto(chatId, photoUrl, caption = '', replyToMessageId = null, businessConnectionId = null) {
+// Send response to Telegram
+async function sendToTelegram(chatId, difyResponse, replyToMessageId, businessConnectionId) {
   const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-  
-  console.log('[TELEGRAM] Sending photo...');
-  console.log('[TELEGRAM] Photo URL:', photoUrl.substring(0, 100));
-  
-  const params = {
-    chat_id: chatId,
-    photo: photoUrl,
-    caption: caption.substring(0, 1024), // Telegram caption limit
-    parse_mode: 'HTML'
-  };
-  
-  if (businessConnectionId) {
-    params.business_connection_id = businessConnectionId;
-  } else if (replyToMessageId) {
-    params.reply_to_message_id = replyToMessageId;
-  }
-  
-  try {
-    const response = await fetchWithTimeout(
-      `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
-      },
-      CONSTANTS.TELEGRAM_TIMEOUT
-    );
-    
-    const data = await response.json();
-    
-    if (!data.ok) {
-      console.error('[TELEGRAM] Photo error:', data.description);
-      throw new Error(data.description || 'Failed to send photo');
-    }
-    
-    console.log('[TELEGRAM] Photo sent successfully!');
-    return data.result;
-    
-  } catch (error) {
-    console.error('[TELEGRAM] Photo send failed:', error.message);
-    throw error;
-  }
-}
-
-// Send media group (multiple photos)
-async function sendTelegramMediaGroup(chatId, photoUrls, caption = '', replyToMessageId = null, businessConnectionId = null) {
-  const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-  
-  console.log('[TELEGRAM] Sending media group...');
-  console.log('[TELEGRAM] Number of photos:', photoUrls.length);
-  
-  // Prepare media array (max 10 photos in a group)
-  const media = photoUrls.slice(0, 10).map((url, index) => ({
-    type: 'photo',
-    media: url,
-    // Only first photo can have caption in media group
-    caption: index === 0 ? caption.substring(0, 1024) : undefined,
-    parse_mode: index === 0 ? 'HTML' : undefined
-  }));
-  
-  const params = {
-    chat_id: chatId,
-    media: media
-  };
-  
-  if (businessConnectionId) {
-    params.business_connection_id = businessConnectionId;
-  } else if (replyToMessageId) {
-    params.reply_to_message_id = replyToMessageId;
-  }
-  
-  try {
-    const response = await fetchWithTimeout(
-      `https://api.telegram.org/bot${BOT_TOKEN}/sendMediaGroup`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
-      },
-      CONSTANTS.TELEGRAM_TIMEOUT * 2 // Longer timeout for multiple images
-    );
-    
-    const data = await response.json();
-    
-    if (!data.ok) {
-      console.error('[TELEGRAM] Media group error:', data.description);
-      throw new Error(data.description || 'Failed to send media group');
-    }
-    
-    console.log('[TELEGRAM] Media group sent successfully!');
-    return data.result;
-    
-  } catch (error) {
-    console.error('[TELEGRAM] Media group send failed:', error.message);
-    throw error;
-  }
-}
-
-// Send Telegram message
-async function sendTelegramMessage(chatId, text, replyToMessageId = null, businessConnectionId = null) {
-  const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-  
-  console.log('[TELEGRAM] Sending message...');
-  console.log('[TELEGRAM] Chat ID:', chatId);
-  console.log('[TELEGRAM] Reply to:', replyToMessageId);
-  console.log('[TELEGRAM] Business Connection ID:', businessConnectionId || 'none');
-  console.log('[TELEGRAM] Text length:', text?.length || 0);
-  
-  if (!BOT_TOKEN) {
-    console.error('[TELEGRAM] No bot token!');
-    throw new Error('Bot token missing');
-  }
-
-  // Clean text
-  let cleanText = text || "✨ İşte senin için hazırladığım yanıt!";
-  cleanText = cleanText.substring(0, CONSTANTS.MAX_MESSAGE_LENGTH);
-  
-  const params = {
-    chat_id: chatId,
-    text: cleanText,
-    disable_web_page_preview: false, // Enable previews for URLs
-    parse_mode: 'HTML'
-  };
-  
-  if (businessConnectionId) {
-    params.business_connection_id = businessConnectionId;
-  } else if (replyToMessageId) {
-    params.reply_to_message_id = replyToMessageId;
-  }
-
-  try {
-    console.log('[TELEGRAM] Sending with params:', JSON.stringify(params).substring(0, 200));
-    
-    const response = await fetchWithTimeout(
-      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
-      },
-      CONSTANTS.TELEGRAM_TIMEOUT
-    );
-
-    const data = await response.json();
-    
-    if (!data.ok) {
-      console.error('[TELEGRAM] Error:', data.description);
-      throw new Error(data.description || 'Telegram API error');
-    }
-
-    console.log('[TELEGRAM] Message sent successfully!');
-    console.log('[TELEGRAM] Message ID:', data.result?.message_id);
-    return data.result;
-    
-  } catch (error) {
-    console.error('[TELEGRAM] Send failed:', error.message);
-    throw error;
-  }
-}
-
-// Smart message sender that handles both text and images
-async function sendSmartMessage(chatId, difyResponse, replyToMessageId = null, businessConnectionId = null) {
-  // Parse the response to extract text and images
   const { text, images } = parseDifyResponse(difyResponse);
   
-  console.log('[SMART] Parsed content:');
-  console.log('[SMART] Text:', text.substring(0, 100));
-  console.log('[SMART] Images found:', images.length);
+  console.log('[SEND] Text:', text.substring(0, 100));
+  console.log('[SEND] Images:', images.length);
   
   try {
     if (images.length === 0) {
-      // No images, just send text
-      return await sendTelegramMessage(chatId, text, replyToMessageId, businessConnectionId);
+      // Send text only
+      const params = {
+        chat_id: chatId,
+        text: text || "💬 İşte yanıtım!",
+        reply_to_message_id: replyToMessageId,
+        disable_web_page_preview: false,
+        parse_mode: 'HTML'
+      };
+      
+      if (businessConnectionId) {
+        params.business_connection_id = businessConnectionId;
+        delete params.reply_to_message_id; // Don't reply for business messages
+      }
+      
+      const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params)
+      });
+      
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.description);
+      
+      return data.result;
       
     } else if (images.length === 1) {
-      // Single image - send as photo with caption
-      return await sendTelegramPhoto(chatId, images[0], text, replyToMessageId, businessConnectionId);
-      
-    } else {
-      // Multiple images - send as media group
-      const result = await sendTelegramMediaGroup(chatId, images, text, replyToMessageId, businessConnectionId);
-      
-      // If text is too long for caption, send it separately
-      if (text.length > 1024) {
-        const remainingText = text.substring(1024);
-        await sendTelegramMessage(chatId, remainingText, null, businessConnectionId);
-      }
-      
-      return result;
-    }
-  } catch (error) {
-    console.error('[SMART] Failed to send smart message:', error.message);
-    // Fallback to simple text message with URLs
-    const fallbackText = text + '\n\n' + images.join('\n\n');
-    return await sendTelegramMessage(chatId, fallbackText, replyToMessageId, businessConnectionId);
-  }
-}
-
-// Send typing action
-async function sendTypingAction(chatId) {
-  const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-  if (!BOT_TOKEN) return;
-  
-  try {
-    const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        chat_id: chatId, 
-        action: 'typing' 
-      }),
-    });
-    
-    if (!response.ok) {
-      const error = await response.json();
-      console.error('[TYPING] Error:', error.description);
-    }
-  } catch (error) {
-    console.error('[TYPING] Failed:', error.message);
-  }
-}
-
-// Send typing action for business messages
-async function sendTypingActionBusiness(chatId, businessConnectionId) {
-  const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-  if (!BOT_TOKEN) return;
-  
-  try {
-    const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        chat_id: chatId, 
-        action: 'typing',
-        business_connection_id: businessConnectionId
-      }),
-    });
-    
-    if (!response.ok) {
-      const error = await response.json();
-      console.error('[TYPING] Business error:', error.description);
-    }
-  } catch (error) {
-    console.error('[TYPING] Business failed:', error.message);
-  }
-}
-
-// Mark business message as read (for double ticks)
-async function markBusinessMessageAsRead(chatId, messageId, businessConnectionId) {
-  const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-  if (!BOT_TOKEN || !businessConnectionId) return;
-  
-  console.log('[READ] Marking message as read...');
-  console.log('[READ] Chat ID:', chatId);
-  console.log('[READ] Message ID:', messageId);
-  console.log('[READ] Business Connection:', businessConnectionId);
-  
-  try {
-    const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/readBusinessMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        business_connection_id: businessConnectionId,
+      // Send single photo
+      const params = {
         chat_id: chatId,
-        message_id: messageId
-      }),
-    });
-    
-    const data = await response.json();
-    if (data.ok) {
-      console.log('[READ] ✅ Message marked as read - double ticks should appear');
+        photo: images[0],
+        caption: text.substring(0, 1024),
+        reply_to_message_id: replyToMessageId,
+        parse_mode: 'HTML'
+      };
+      
+      if (businessConnectionId) {
+        params.business_connection_id = businessConnectionId;
+        delete params.reply_to_message_id;
+      }
+      
+      const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params)
+      });
+      
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.description);
+      
+      return data.result;
+      
     } else {
-      console.error('[READ] Failed to mark as read:', data.description);
+      // Send media group
+      const media = images.slice(0, 10).map((url, index) => ({
+        type: 'photo',
+        media: url,
+        caption: index === 0 ? text.substring(0, 1024) : undefined,
+        parse_mode: index === 0 ? 'HTML' : undefined
+      }));
+      
+      const params = {
+        chat_id: chatId,
+        media: media,
+        reply_to_message_id: replyToMessageId
+      };
+      
+      if (businessConnectionId) {
+        params.business_connection_id = businessConnectionId;
+        delete params.reply_to_message_id;
+      }
+      
+      const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMediaGroup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params)
+      });
+      
+      const data = await response.json();
+      if (!data.ok) throw new Error(data.description);
+      
+      return data.result;
     }
   } catch (error) {
-    console.error('[READ] Error marking message as read:', error.message);
+    console.error('[SEND] Failed:', error.message);
+    
+    // Fallback to simple text
+    const params = {
+      chat_id: chatId,
+      text: "😔 Yanıtı gönderemedim. Lütfen tekrar dene.",
+      reply_to_message_id: replyToMessageId
+    };
+    
+    if (businessConnectionId) {
+      params.business_connection_id = businessConnectionId;
+      delete params.reply_to_message_id;
+    }
+    
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params)
+    });
   }
 }
 
-// Main message handler WITH BUSINESS SUPPORT
-async function handleMessage(message, businessConnectionId = null) {
+// Process single queue item
+async function processQueueItem(item) {
+  console.log('[PROCESS] Processing:', item.id);
   const startTime = Date.now();
-  const chatId = message.chat?.id;
-  const messageId = message.message_id;
-  const userMessage = message.text || message.caption || '';
-  const userId = message.from?.id;
-  const userName = message.from?.first_name || 'User';
-  const isBusinessMessage = !!businessConnectionId;
-
-  console.log('=====================================');
-  console.log('[MESSAGE] New message received');
-  console.log('[MESSAGE] Type:', isBusinessMessage ? 'BUSINESS' : 'REGULAR');
-  console.log('[MESSAGE] From:', userName, `(${userId})`);
-  console.log('[MESSAGE] Chat:', chatId);
-  console.log('[MESSAGE] Business Connection ID:', businessConnectionId || 'NONE');
-  console.log('[MESSAGE] Text:', userMessage.substring(0, 100));
-  console.log('=====================================');
-
-  if (!chatId || !userMessage) {
-    console.log('[MESSAGE] Invalid - missing chatId or text');
-    return;
-  }
-
-  // For regular messages, only respond to private chats
-  if (!isBusinessMessage && message.chat.type !== 'private') {
-    console.log('[MESSAGE] Ignoring non-private chat');
-    return;
-  }
-
-  let typingInterval = null;
-
+  
   try {
-    // IMPORTANT: Mark business message as read immediately for double ticks
-    if (businessConnectionId && messageId) {
-      await markBusinessMessageAsRead(chatId, messageId, businessConnectionId);
-    }
-    
-    // Send initial typing indicator
-    if (businessConnectionId) {
-      await sendTypingActionBusiness(chatId, businessConnectionId);
-    } else {
-      await sendTypingAction(chatId);
-    }
-    
-    // Keep sending typing indicator every 5 seconds
-    typingInterval = setInterval(async () => {
-      try {
-        if (businessConnectionId) {
-          await sendTypingActionBusiness(chatId, businessConnectionId);
-        } else {
-          await sendTypingAction(chatId);
-        }
-        console.log('[TYPING] Refreshed typing indicator');
-      } catch (err) {
-        console.error('[TYPING] Failed to refresh:', err.message);
-      }
-    }, 5000); // Every 5 seconds
-    
     // Get session
-    const session = getSession(userId);
-    console.log('[SESSION] Current conversation:', session.conversationId || 'new');
+    const conversationId = await getSession(item.userId);
     
-    // Call Dify AI
-    const difyResponse = await getDifyResponse(
-      userMessage,
-      userName,
-      session.conversationId
+    // Call Dify
+    const difyResponse = await callDifyAPI(
+      item.text,
+      item.userName,
+      conversationId
     );
     
-    // Clear typing indicator before sending message
-    if (typingInterval) {
-      clearInterval(typingInterval);
-      typingInterval = null;
+    // Update session
+    if (difyResponse.conversation_id) {
+      await updateSession(item.userId, difyResponse.conversation_id);
     }
     
-    // Update session if we got a conversation ID
-    if (difyResponse?.conversation_id) {
-      updateSession(userId, difyResponse.conversation_id);
-      console.log('[SESSION] Updated with ID:', difyResponse.conversation_id);
-    }
-    
-    // Send response using smart message handler
-    console.log('[RESPONSE] Sending smart message...');
-    await sendSmartMessage(chatId, difyResponse, messageId, businessConnectionId);
+    // Send response
+    await sendToTelegram(
+      item.chatId,
+      difyResponse,
+      item.messageId,
+      item.businessConnectionId
+    );
     
     const elapsed = Date.now() - startTime;
-    console.log(`[SUCCESS] ✅ Completed in ${elapsed}ms`);
+    console.log(`[PROCESS] Completed ${item.id} in ${elapsed}ms`);
+    
+    return true;
     
   } catch (error) {
-    console.error('[ERROR] Processing failed:', error.message);
-    console.error('[ERROR] Stack:', error.stack);
+    console.error(`[PROCESS] Failed ${item.id}:`, error.message);
     
-    // Clear typing indicator if still running
-    if (typingInterval) {
-      clearInterval(typingInterval);
-    }
-    
-    // Try to send fallback message WITH businessConnectionId
+    // Send error message
     try {
-      await sendTelegramMessage(chatId, CONSTANTS.FALLBACK_MESSAGE, messageId, businessConnectionId);
-      console.log('[FALLBACK] Sent fallback message');
-    } catch (fallbackError) {
-      console.error('[FALLBACK] Failed:', fallbackError.message);
+      const params = {
+        chat_id: item.chatId,
+        text: "😔 Bir sorun oluştu. Lütfen tekrar dene.",
+        reply_to_message_id: item.messageId
+      };
+      
+      if (item.businessConnectionId) {
+        params.business_connection_id = item.businessConnectionId;
+        delete params.reply_to_message_id;
+      }
+      
+      await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params)
+      });
+    } catch (err) {
+      console.error('[PROCESS] Failed to send error message:', err.message);
     }
+    
+    return false;
   }
 }
 
-// Main webhook handler
-export default async function handler(req, res) {
-  const startTime = Date.now();
-  
-  console.log('=====================================');
-  console.log(`[WEBHOOK] Called at ${new Date().toISOString()}`);
-  console.log('[WEBHOOK] Method:', req.method);
-  console.log('[WEBHOOK] Body:', JSON.stringify(req.body).substring(0, 500));
-  console.log('=====================================');
-  
-  // Only accept POST
-  if (req.method !== 'POST') {
-    console.log('[WEBHOOK] Not POST, returning 405');
-    return res.status(405).json({ error: 'Method not allowed' });
+// Process queue
+async function processQueue() {
+  // Check if already processing
+  const isProcessing = await kv.get(PROCESS_CONSTANTS.PROCESSING_KEY);
+  if (isProcessing) {
+    console.log('[QUEUE] Already processing, skipping');
+    return { processed: 0, message: 'Already processing' };
   }
+  
+  // Set processing flag
+  await kv.set(PROCESS_CONSTANTS.PROCESSING_KEY, true, { ex: 50 });
+  
+  let processed = 0;
+  const maxProcess = 10; // Process max 10 items per run
+  
+  try {
+    while (processed < maxProcess) {
+      // Get next item from queue
+      const itemJson = await kv.rpop(PROCESS_CONSTANTS.QUEUE_KEY);
+      if (!itemJson) break;
+      
+      const item = JSON.parse(itemJson);
+      
+      // Skip old items (older than 5 minutes)
+      if (Date.now() - item.timestamp > 300000) {
+        console.log('[QUEUE] Skipping old item:', item.id);
+        continue;
+      }
+      
+      // Process item
+      await processQueueItem(item);
+      processed++;
+      
+      // Small delay between items
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+  } finally {
+    // Clear processing flag
+    await kv.del(PROCESS_CONSTANTS.PROCESSING_KEY);
+  }
+  
+  console.log(`[QUEUE] Processed ${processed} items`);
+  return { processed, message: 'Queue processed' };
+}
 
-  // Check environment variables
-  const envVars = {
-    TOKEN: !!process.env.TELEGRAM_BOT_TOKEN,
-    DIFY_URL: !!process.env.DIFY_API_URL,
-    DIFY_TOKEN: !!process.env.DIFY_API_TOKEN
-  };
+// API handler for process endpoint
+export default async function handler(req, res) {
+  console.log('[PROCESSOR] Called at', new Date().toISOString());
   
-  console.log('[ENV] Variables present:', envVars);
+  // Simple auth check
+  const auth = req.headers.authorization;
+  const expectedAuth = `Bearer ${process.env.INTERNAL_SECRET || 'secret'}`;
   
-  if (!envVars.TOKEN || !envVars.DIFY_URL || !envVars.DIFY_TOKEN) {
-    console.error('[ENV] Missing required environment variables');
-    return res.status(500).json({ error: 'Configuration error', envVars });
+  if (auth !== expectedAuth) {
+    return res.status(401).json({ error: 'Unauthorized' });
   }
   
   try {
-    const update = req.body;
-    
-    if (!update) {
-      console.log('[WEBHOOK] No body, returning 400');
-      return res.status(400).json({ error: 'No body' });
-    }
-    
-    // Log update type
-    const updateType = Object.keys(update).find(key => key !== 'update_id');
-    console.log('[WEBHOOK] Update type:', updateType);
-    
-    // Handle different update types
-    if (update.message) {
-      console.log('[WEBHOOK] Processing regular message');
-      if (update.message.text || update.message.caption) {
-        await handleMessage(update.message, null);
-      } else {
-        console.log('[WEBHOOK] Message has no text/caption, ignoring');
-      }
-    } else if (update.business_message) {
-      console.log('[WEBHOOK] Processing BUSINESS message');
-      if (update.business_message.text || update.business_message.caption) {
-        // CRITICAL: Extract and pass business_connection_id
-        const businessConnectionId = update.business_message.business_connection_id;
-        console.log('[WEBHOOK] Business Connection ID:', businessConnectionId);
-        await handleMessage(update.business_message, businessConnectionId);
-      } else {
-        console.log('[WEBHOOK] Business message has no text/caption, ignoring');
-      }
-    } else {
-      console.log('[WEBHOOK] Ignoring update type:', updateType);
-    }
-    
-    const elapsed = Date.now() - startTime;
-    console.log(`[WEBHOOK] Completed in ${elapsed}ms`);
-    
-    // Always return success
-    return res.status(200).json({ ok: true });
-    
+    const result = await processQueue();
+    return res.status(200).json(result);
   } catch (error) {
-    console.error('[WEBHOOK] Critical error:', error.message);
-    console.error('[WEBHOOK] Stack:', error.stack);
-    
-    // Still return 200 to prevent Telegram retries
-    return res.status(200).json({ ok: true, error: error.message });
+    console.error('[PROCESSOR] Error:', error.message);
+    return res.status(500).json({ error: error.message });
   }
 }
-
-// Updated: Force deployment with image support
